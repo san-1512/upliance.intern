@@ -1,0 +1,156 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
+
+// Constants
+#define TAG "HeaterController"
+#define TEMP_MEASURE_INTERVAL_MS 2000 // 2 secs
+
+#define HEATER_GPIO GPIO_NUM_18
+#define LED_GPIO    GPIO_NUM_2
+#define BUZZER_GPIO GPIO_NUM_4
+
+// Simulated thresholds
+#define TEMP_IDLE          20.0
+#define TEMP_HEATING_START 25.0
+#define TEMP_TARGET        60.0
+#define TEMP_STABILIZE     58.0
+#define TEMP_OVERHEAT      75.0
+
+// Heating states
+typedef enum {
+    STATE_IDLE,
+    STATE_HEATING,
+    STATE_STABILIZING,
+    STATE_TARGET_REACHED,
+    STATE_OVERHEAT
+} HeaterState;
+
+static HeaterState current_state = STATE_IDLE;
+static float current_temperature = 20.0;  // Start temp
+static bool heater_on = false;
+
+// --- Simulated or replace with actual ADC or sensor read ---
+float read_temperature_simulated() {
+    static float temp = 20.0;
+    // Simulate heating
+    if (heater_on) temp += 1.2;
+    else temp -= 0.5;
+
+    if (temp < 20.0) temp = 20.0;
+    if (temp > 80.0) temp = 80.0;
+
+    return temp;
+}
+
+// --- Update State Based on Temperature ---
+void update_state() {
+    if (current_temperature >= TEMP_OVERHEAT) {
+        current_state = STATE_OVERHEAT;
+    } else if (current_temperature >= TEMP_TARGET) {
+        current_state = STATE_TARGET_REACHED;
+    } else if (current_temperature >= TEMP_STABILIZE) {
+        current_state = STATE_STABILIZING;
+    } else if (current_temperature >= TEMP_HEATING_START) {
+        current_state = STATE_HEATING;
+    } else {
+        current_state = STATE_IDLE;
+    }
+}
+
+// --- Control Heater ---
+void control_heater() {
+    if (current_state == STATE_HEATING) {
+        gpio_set_level(HEATER_GPIO, 1);
+        heater_on = true;
+    } else {
+        gpio_set_level(HEATER_GPIO, 0);
+        heater_on = false;
+    }
+}
+
+// --- Visual Indicator ---
+void update_visuals() {
+    gpio_set_level(LED_GPIO, current_state != STATE_IDLE);
+    gpio_set_level(BUZZER_GPIO, current_state == STATE_OVERHEAT ? 1 : 0);
+}
+
+// --- Log Status ---
+void log_status() {
+    ESP_LOGI(TAG, "Temp: %.2f°C | Heater: %s | State: %d",
+             current_temperature, heater_on ? "ON" : "OFF", current_state);
+}
+
+// --- BLE Advertise Current State ---
+void update_ble_adv() {
+    char adv_data[8];
+    sprintf(adv_data, "S%d", current_state);
+
+    esp_ble_gap_config_adv_data_raw((uint8_t*)adv_data, strlen(adv_data)); // Simplified
+}
+
+// --- Periodic Temperature Monitor Task ---
+void temp_task(void *pvParam) {
+    while (1) {
+        current_temperature = read_temperature_simulated();
+        update_state();
+        control_heater();
+        update_visuals();
+        update_ble_adv();
+        log_status();
+
+        vTaskDelay(pdMS_TO_TICKS(TEMP_MEASURE_INTERVAL_MS));
+    }
+}
+
+// --- GPIO Setup ---
+void setup_gpio() {
+    gpio_reset_pin(HEATER_GPIO);
+    gpio_set_direction(HEATER_GPIO, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(BUZZER_GPIO);
+    gpio_set_direction(BUZZER_GPIO, GPIO_MODE_OUTPUT);
+}
+
+// --- BLE GAP Callback (required stub) ---
+void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    switch (event) {
+        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            esp_ble_gap_start_advertising(&(esp_ble_adv_params_t){
+                .adv_int_min = 0x20,
+                .adv_int_max = 0x40,
+                .adv_type = ADV_TYPE_NONCONN_IND,
+                .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+                .channel_map = ADV_CHNL_ALL,
+                .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+            });
+            break;
+        default:
+            break;
+    }
+}
+
+extern "C" void app_main() {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_cb));
+
+    setup_gpio();
+
+    xTaskCreate(temp_task, "temperature_task", 4096, NULL, 5, NULL);
+}
